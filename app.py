@@ -146,7 +146,8 @@ async def proxy(path: str, request: Request):
     body = await request.body()
     query = str(request.url.query)
     fwd_headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in HOP_HEADERS}
+                   if k.lower() not in HOP_HEADERS
+                   and k.lower() != "accept-encoding"}
     url = f"{UPSTREAM}/{path}" + (f"?{query}" if query else "")
 
     last_status, last_body = 502, b"all keys failed"
@@ -163,6 +164,8 @@ async def proxy(path: str, request: Request):
         try:
             headers = dict(fwd_headers)
             headers["Authorization"] = f"Bearer {key}"
+            # 强制上游返回明文：避免 gzip/br 编解码在网关处错位。
+            headers["Accept-Encoding"] = "identity"
             req = client.build_request(request.method, url, headers=headers,
                                        content=body)
             t0 = time.time()
@@ -180,10 +183,12 @@ async def proxy(path: str, request: Request):
                 await client.aclose()
                 sem.release()
                 continue
+            # 注意：httpx 已把上游 gzip/br 解码成明文再交出来，所以下游
+            # 绝不能再带 content-encoding，否则浏览器会把明文当 gzip 解而失败。
             resp_headers = {
                 k: v for k, v in r.headers.items()
                 if k.lower() not in HOP_HEADERS
-                and k.lower() != "content-length"
+                and k.lower() not in ("content-length", "content-encoding")
             }
             log.info("slot %s -> %s (%.1fs)",
                      name, r.status_code, time.time() - t0)
