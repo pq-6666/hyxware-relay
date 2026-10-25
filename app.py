@@ -9,6 +9,11 @@ https://hyxware.com/v1，每号独立并发上限（默认 10），429/5xx/无�
 - 13 个 key 只走 Render 环境变量，绝不写进仓库、文件或日志。
 - 对外回显只用掩码（前 6 + 后 4），绝不输出完整值。
 - 单 worker 运行：多 worker 会让每号并发上限翻倍。
+
+流式转发注意：上游 httpx 流和每号信号量必须由响应生成器持有、
+在流结束时才释放——绝不能包在 async with 里提前关闭，否则客户端
+收到的是空 body（2026-10-25 实测：/v1/models 因此返回空体，
+客户端报 Upstream model list response was not valid JSON）。
 """
 import asyncio
 import itertools
@@ -17,7 +22,7 @@ import os
 import time
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -115,7 +120,8 @@ async def keys_check(request: Request):
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     results = {}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0),
+                                 trust_env=False) as client:
         for name, key in KEYS.items():
             try:
                 r = await client.get(
@@ -147,45 +153,73 @@ async def proxy(path: str, request: Request):
     for name in ordered_slots():
         key = KEYS[name]
         sem = SEMAPHORES[name]
+        # 信号量手动持有：流式响应要在整个 body 送完后才释放，
+        # 不能用 async with 在 return 时提前释放。
+        await sem.acquire()
+        # trust_env=False：不读本地代理环境变量（本机代理变量格式会被
+        # httpx 严格解析拒绝，致 AsyncClient 构造即 500；生产环境直连上游）。
+        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0),
+                                   trust_env=False)
         try:
-            async with sem:
-                t0 = time.time()
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(300.0, connect=30.0)
-                ) as client:
-                    headers = dict(fwd_headers)
-                    headers["Authorization"] = f"Bearer {key}"
-                    async with client.stream(
-                        request.method, url, headers=headers, content=body
-                    ) as r:
-                        if r.status_code >= 400:
-                            last_status = r.status_code
-                            last_body = await r.aread()
-                            wait = 30.0 if r.status_code == 429 else 10.0
-                            COOLDOWN_UNTIL[name] = time.time() + wait
-                            log.info("slot %s -> %s (%.1fs), retry next",
-                                     name, r.status_code, time.time() - t0)
-                            continue
-                        resp_headers = {
-                            k: v for k, v in r.headers.items()
-                            if k.lower() not in HOP_HEADERS
-                            and k.lower() != "content-length"
-                        }
-                        log.info("slot %s -> %s (%.1fs)",
-                                 name, r.status_code, time.time() - t0)
+            headers = dict(fwd_headers)
+            headers["Authorization"] = f"Bearer {key}"
+            req = client.build_request(request.method, url, headers=headers,
+                                       content=body)
+            t0 = time.time()
+            # 手动管理流生命周期：不在 async with 里打开，否则生成器
+            # 执行时上游连接已关闭，客户端只能收到空 body。
+            r = await client.send(req, stream=True)
+            if r.status_code >= 400:
+                last_status = r.status_code
+                last_body = await r.aread()
+                wait = 30.0 if r.status_code == 429 else 10.0
+                COOLDOWN_UNTIL[name] = time.time() + wait
+                log.info("slot %s -> %s (%.1fs), retry next",
+                         name, r.status_code, time.time() - t0)
+                await r.aclose()
+                await client.aclose()
+                sem.release()
+                continue
+            resp_headers = {
+                k: v for k, v in r.headers.items()
+                if k.lower() not in HOP_HEADERS
+                and k.lower() != "content-length"
+            }
+            log.info("slot %s -> %s (%.1fs)",
+                     name, r.status_code, time.time() - t0)
 
-                        async def gen():
-                            async for chunk in r.aiter_bytes():
-                                yield chunk
+            async def gen(r=r, client=client, sem=sem):
+                try:
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+                finally:
+                    await r.aclose()
+                    await client.aclose()
+                    sem.release()
 
-                        return StreamingResponse(
-                            gen(), status_code=r.status_code,
-                            headers=resp_headers,
-                            media_type=r.headers.get("content-type"),
-                        )
+            return StreamingResponse(
+                gen(), status_code=r.status_code,
+                headers=resp_headers,
+                media_type=r.headers.get("content-type"),
+            )
         except Exception as e:  # noqa: BLE001 - 无响应也换号重试
             COOLDOWN_UNTIL[name] = time.time() + 10.0
             last_status, last_body = 502, str(e).encode()[:200]
-            log.info("slot %s -> no response (%s), retry next", name, type(e).__name__)
+            log.info("slot %s -> no response (%s), retry next",
+                     name, type(e).__name__)
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - 清理失败不影响换号
+                pass
+            sem.release()
             continue
-    return Response(content=last_body, status_code=last_status)
+    # 全号失败：返回 JSON 错误体，客户端至少能解析出原因，
+    # 而不是收到一段纯文本导致 not valid JSON。
+    try:
+        detail = last_body.decode("utf-8", "replace")[:500]
+    except Exception:  # noqa: BLE001 - 解码失败时给通用文案
+        detail = "upstream failed"
+    return JSONResponse(
+        {"error": {"message": detail, "type": "upstream_failed"}},
+        status_code=last_status if 400 <= last_status <= 599 else 502,
+    )
